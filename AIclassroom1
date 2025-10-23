@@ -1,0 +1,176 @@
+# classroom_sim.py
+# pip install openai==1.* (or compatible client)
+import os, asyncio, json, random, time
+from dataclasses import dataclass, field
+from typing import Dict, List
+
+# ==== CONFIGURE ====
+MODEL = "gpt-4o-mini"          # replace if needed
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+# ==== PLACEHOLDER LLM CALL ====
+async def call_llm(system_prompt: str, user_prompt: str) -> str:
+    """
+    Replace this stub with your API call.
+    Example (OpenAI 1.x):
+        from openai import OpenAI
+        client = OpenAI()
+        resp = await client.chat.completions.create(
+            model=MODEL,
+            messages=[{"role":"system","content":system_prompt},
+                      {"role":"user","content":user_prompt}],
+            temperature=0.7,
+        )
+        return resp.choices[0].message.content.strip()
+    """
+    await asyncio.sleep(0.05)
+    return f"[LLM:{user_prompt[:120]}]"
+
+# ==== INPUTS ====
+INPUTS = {
+    "topic": "Open topic",
+    "theme": "To be set by instructor",
+    "objective": "Formulate and test a hypothesis",
+    "engagement": 7,        # 1–10
+    "cooperation": 7,       # 1–10
+    "competition": 4,       # 1–10
+    "max_statements": 2,    # 0–2 per student per round
+    "allow_free_turn_order": True,
+    "instructor_interrupt": True,
+    "rounds": 2
+}
+
+# ==== SYSTEM PROMPTS ====
+def sys_instructor(p):
+    return f"""You are the Instructor. PhD in {p['topic']}. 30+ years experience.
+Socratic method. No lectures. Guide by questions.
+Discipline={p['topic']} | Theme={p['theme']} | Objective={p['objective']}
+Controls: Engagement={p['engagement']}/10 Cooperation={p['cooperation']}/10 Competition={p['competition']}/10
+Max student statements/round={p['max_statements']} Free turn={p['allow_free_turn_order']} Interrupt={p['instructor_interrupt']}
+Framework: content → conceptual → examples → misconceptions → extrapolation.
+Rules: open with 1 guiding question + ≤1 hint; ≤80 words per intervention; redirect drift; synthesize briefly; encourage peer-to-peer first."""
+def sys_A(p):
+    return f"""You are Student A (Analytical). Engagement={p['engagement']}/10 Cooperation={p['cooperation']}/10 Competition={p['competition']}/10.
+≤60 words. One precise question or tight argument. Challenge logic if competition≥5. Stay aligned to theme and objective."""
+def sys_B(p):
+    return f"""You are Student B (Experiential). Engagement={p['engagement']}/10 Cooperation={p['cooperation']}/10 Competition={p['competition']}/10.
+≤70 words. Provide one concrete example/test or tiny code. Tie back to objective. Defend with evidence if challenged."""
+def sys_C(p):
+    return f"""You are Student C (Integrative). Engagement={p['engagement']}/10 Cooperation={p['cooperation']}/10 Competition={p['competition']}/10.
+≤65 words. Synthesize peers in 1–2 sentences and add one extrapolation or check. Keep coherence with theme and objective."""
+
+# ==== STATE ====
+@dataclass
+class Turn:
+    role: str
+    content: str
+    ts: float = field(default_factory=time.time)
+
+@dataclass
+class State:
+    board: Dict = field(default_factory=lambda: {
+        "topic":"", "question":"", "hint":""
+    })
+    submissions: Dict[str,str] = field(default_factory=lambda: {"A":"","B":"","C":""})
+    rubric: Dict[str,float] = field(default_factory=lambda: {"correctness":0.0,"clarity":0.0,"collaboration":0.0})
+    log: List[Turn] = field(default_factory=list)
+
+# ==== UTIL ====
+def user_ctx(state: State, role: str) -> str:
+    ctx = {
+        "board": state.board,
+        "submissions": state.submissions,
+        "rubric": state.rubric,
+        "speak_as": role
+    }
+    return "Context:\n" + json.dumps(ctx, ensure_ascii=False)
+
+def rand_prob_scaled(base: float, level: int) -> bool:
+    # level 1–10 scales probability linearly
+    return random.random() < min(0.95, max(0.0, base * (level/10.0)))
+
+# ==== ORCHESTRATION ====
+async def instructor_open(state: State, p):
+    q = "Propose a precise guiding question tied to the objective, plus ≤1 short hint."
+    out = await call_llm(sys_instructor(p), user_ctx(state,"instructor") + "\n" + q)
+    state.log.append(Turn("instructor", out))
+    # Lightweight parse: first sentence as question, look for "Hint:"
+    question = out.split("\n")[0].strip()
+    hint = ""
+    if "Hint:" in out:
+        hint = out.split("Hint:",1)[1].split("\n")[0].strip()
+    state.board["topic"] = p["topic"]
+    state.board["question"] = question
+    state.board["hint"] = hint or "Focus on the objective."
+    return out
+
+async def instructor_intervene(state: State, p, target: str):
+    ask = f"Diagnose {target}'s latest remark. If off-topic or flawed, ask one probing question or give one-sentence nudge."
+    out = await call_llm(sys_instructor(p), user_ctx(state,"instructor") + "\n" + ask)
+    state.log.append(Turn("instructor", out))
+    return out
+
+async def instructor_close(state: State, p):
+    ask = "Close the round with ≤3 sentences synthesizing across content, conceptual links, examples, misconceptions, extrapolation. Set next guiding question."
+    out = await call_llm(sys_instructor(p), user_ctx(state,"instructor") + "\n" + ask)
+    state.log.append(Turn("instructor", out))
+    # naive scoring tick
+    state.rubric["correctness"] = min(1.0, state.rubric["correctness"] + 0.3)
+    state.rubric["clarity"] = min(1.0, state.rubric["clarity"] + 0.3)
+    state.rubric["collaboration"] = min(1.0, state.rubric["collaboration"] + 0.4*(p["cooperation"]/10))
+    return out
+
+async def student_turn(state: State, p, student: str, sys_prompt: str):
+    # engagement increases chance of taking a turn; competition shifts tone through prompt already
+    if p["max_statements"] <= 0:
+        return None
+    if not rand_prob_scaled(0.7, p["engagement"]):
+        return None
+    # peer referencing increases with cooperation
+    peer_hint = ""
+    if rand_prob_scaled(0.5, p["cooperation"]):
+        peer_hint = " Where relevant, tie or contrast with a peer's prior remark."
+    ask = f"Contribute one turn per your constraints.{peer_hint}"
+    out = await call_llm(sys_prompt, user_ctx(state, student) + "\n" + ask)
+    state.log.append(Turn(student, out))
+    tag = {"student_a":"A","student_b":"B","student_c":"C"}[student]
+    state.submissions[tag] = out
+    return out
+
+async def run_round(state: State, p, r_ix: int):
+    if r_ix == 1:
+        await instructor_open(state, p)
+
+    order = ["student_a","student_b","student_c"]
+    if p["allow_free_turn_order"]:
+        random.shuffle(order)
+
+    # Each student may speak up to max_statements times
+    for s in order:
+        for _ in range(p["max_statements"]):
+            sys_map = {
+                "student_a": sys_A(p),
+                "student_b": sys_B(p),
+                "student_c": sys_C(p)
+            }
+            out = await student_turn(state, p, s, sys_map[s])
+            if out and p["instructor_interrupt"] and rand_prob_scaled(0.4, 11-p["cooperation"] + p["competition"]):
+                await instructor_intervene(state, p, s)
+
+    await instructor_close(state, p)
+
+async def main(p=INPUTS):
+    random.seed(42)
+    state = State()
+    for r in range(1, p["rounds"]+1):
+        await run_round(state, p, r)
+        if state.rubric["correctness"] >= 0.9:
+            break
+
+    # Print transcript
+    for t in state.log:
+        role = t.role.upper()
+        print(f"{role}:\n{t.content}\n")
+
+if __name__ == "__main__":
+    asyncio.run(main())
